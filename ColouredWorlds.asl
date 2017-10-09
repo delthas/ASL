@@ -4,12 +4,12 @@
 // Author: delthas (delthas@dille.cc) (https://github.com/Delthas/ASL/)
 // Creation date: 2017-10-09
 // License: MIT
-// Version: 1.0
+// Version: 1.1
 //
 // Even though the game itself is pretty niche, the functions used can
 // be applied to any Love2D game (compiled with LuaJIT). You may have
-// to edit the "vars.Registry" static pointer path since the love DLL
-// might change. The hash table algorithms should stay valid though.
+// to edit the "lua local state" static pointer path. The hash table 
+// algorithms should stay valid though.
 //
 // A quick starter on how LuaJIT stores tables/modules:
 //
@@ -31,9 +31,13 @@
 // e.g. everything that has been loaded with require("stuff"), which
 // themselves are tables that contain their fields, which can be e.g.
 // numbers, or tables, in which case they may contain other tables, ...
+//
+// There is also another table, called the table of globals, that holds all
+// the global variables in the code (those not explicitly created with
+// "local").
 // 
-// Also, the only LuaJIT implementation for numbers is the C double.
-// This might help you when searching for fields.
+// Also, the only LuaJIT implementation for numbers is the C double (and
+// and booleans). This might help you when searching for fields.
 //
 // If you want to delve deep into the LuaJIT code, you can find it here:
 // http://luajit.org/download.html (I have used LuaJIT 2.0.3).
@@ -157,58 +161,96 @@ init
 	vars.Memory = memory;
 	vars.Modules = modules;
 
-	// Get the address of the root registry hash table, stored in the LuaJIT global state struct.
-	// [[["love.dll"+0x002AB900] + 0x14] + 0x02AC] is the local lua state struct
-	// [[[["love.dll"+0x002AB900] + 0x14] + 0x02AC] + 0x08] is the the global state struct
-	// [[[["love.dll"+0x002AB900] + 0x14] + 0x02AC] + 0x08] + 0x88] is the the registry hash table
-	// This is what might change between Love2D versions, or game versions.
-	// The 0x08 and 0x88 offsets will probably not change.
-	// An easy way you can find the registry hash table is the following:
-	// - Scan for the following pattern ("Grouped" on Cheat Engine):
-	//   00 00 00 00 FF FF FF FF 00 00 00 00 FF FF FF FF
-	//   00 00 00 00 §§ §§ §§ §§ ?? ?? ?? ?? ?? ?? 00 00 
-	//   00 00 00 00 00 00 00 00
-	// - Replace "§§ §§ §§ §§" with "?? ?? ?? ??".
-	// - Take the pattern for which the value at "§§ §§ §§ §§" is the address
-	//    of the beginning of the pattern.
-	// - Add 48 (decimal) to the address of the beginning of the pattern, and deref it. That's it.
+	// Get the address of the local LuaJIT state struct.
 	//
-	// Note: this is not currently doable with a signature scan because this data isn't stored in
-	//       a module segment, but on the heap, whose bounds you can't know statically. You can 
-	//       however do this once, manually, in Cheat Engine, and then do a pointer scan, and
-	//       replace the path below with the found pointer path. Beware that the GetPointerPath
-	//       doesn't exactly work like DeepPointer.
-	vars.Registry = vars.GetPointerPath("love.dll", new[]{0x002AB900, 0x14, 0x02AC, 0x8, 0x88});
+	// The static pointer path I have found may be wrong, and may change between
+	// Love2D versions/game versions. In this case you will have to find another one.
+	//
+	// The easiest way to (manually) find the address of the local LuaJIT state struct,
+	// in order to make a pointer scan on it, is simply to get the address pointed at by
+	// "THREADSTACK0-A0" in Cheat Engine. This works as of Love2D 0.10.2 and should keep
+	// working for a while.
+	// The reason this pointer cannot be used is that ASL doesn't support (semi-)static
+	// pointer paths starting with a pointer relative to the main thread stack base.
+	//
+	// Beware that GetPointerPath doesn't exactly work like DeepPointer. Read the
+	// documentation above.
+	//
+	// You'll probably have to change this.
+	vars.LocalState = vars.GetPointerPath("MSVCR110.dll", new[]{0x000C8E2C, 0x6D8});
 	
-	// Once we have the registry hash table, we can obtain any field by following this path:
-	// _LOADED (the table containing all the tables you can call "require(...)" on)
-	// <module> (the table containing all the objects declared in the <module>)
-	// <field> (the name of the field in <module>)
-	// If there is a (sub-)field inside your field, just add it to the path, and so on.
-	// e.g. for a.b.c.d.e where "a" is the module (e.g. require("a") appears in the code),
-	// the path would be "_LOADED", "a", "b", "c", "d", "e"
+	// The local LuaJIT state contains a pointer to the global LuaJIT struct at offset
+	// 0x8, which contains a pointer to the registry table at offset 0x88.
+	// I believe these offsets will not change.
+	vars.Registry = vars.ReadPointer(vars.ReadPointer(vars.LocalState + 0x8) + 0x88);
 	
-	// If <module> is e.g. "love.physics" I believe the path needs to be
-	// "_LOADED", "love", "physics", ..., not "_LOADED", "love.physics", ...
+	// The local LuaJIT state contains a pointer to the global table at offset 0x24.
+	// I believe this offset will not change.
+	vars.Globals = vars.ReadPointer(vars.LocalState + 0x24);
 	
-	// We want to get a double, which is a number, so we don't want to deref the last
-	// address: pass false as last argument
-	vars.ElapsedAddress = vars.GetMapValueChain(vars.Registry, new[]{"_LOADED", "game", "elapsed"}, false);
+	// Once the registry table and the globals table are loaded, any symbol can be loaded:
+	// - for global variables, the variable path is:
+	//   Globals -> <global name> -> ...
+	//   e.g. for game.elapsed where game is a global variable:
+	//   Globals -> "game" -> "elapsed"
+	// - for variables in modules, the variable path is:
+	//   Registry -> "_LOADED" -> <field name> -> ...
+	//   e.g. for game.elapsed where game is a module loaded somewhere with require("game"):
+	//   Registry -> "_LOADED" -> "game" -> "elapsed"
+	//
+	// However the variables shouldn't be searched right away because they're probably not all
+	// loaded by the time the init function is called. We should do that in update instead,
+	// repeateadly, until they're loaded.
 	
-	// Build a memory watcher for the address
-	vars.Elapsed = new MemoryWatcher<double>(new IntPtr(vars.ElapsedAddress));
+	vars.Init = false;
 	
 }
 
-// Usual splitter stuff
 update
 {
-	// Update the memory watcher
+	if(!vars.Init)
+	{
+		// Get the address of a field in a module: use Registry and _LOADED.
+	
+		// We want to get a double, which is a number, so we don't want to deref the last
+		// address: pass false as last argument
+		// The field we want to get is simply game.elapsed, where game is a module (e.g. require("game"))
+		vars.ElapsedAddress = vars.GetMapValueChain(vars.Registry, new[]{"_LOADED", "game", "elapsed"}, false);
+		
+		// If the address is zero, we failed to load it, probably because the game hasn't
+		// loaded it yet. Return early before doing anything else.
+		if(vars.ElapsedAddress == 0x0) return;
+	
+		// Build a memory watcher for the address
+		vars.Elapsed = new MemoryWatcher<double>(new IntPtr(vars.ElapsedAddress));
+		
+		// Do the same for other fields
+		vars.LevelAddress = vars.GetMapValueChain(vars.Registry, new[]{"_LOADED", "game", "level"}, false);
+		vars.Level = new MemoryWatcher<double>(new IntPtr(vars.LevelAddress));
+		
+		// This field is global ("utils"), so use the Globals table
+		vars.MenuAddress = vars.GetMapValueChain(vars.Globals, new[]{"utils", "menu"}, false);
+		// The menu field is a boolean. Booleans are special in LuaJIT:
+		// - add 0x4 to the address given by GetMapValueChain to get their actual address
+		// - the value for true is the 0xFFFFFFFD 32-bit integer
+		// - the value for false is the 0xFFFFFFFE 32-bit integer
+		vars.Menu = new MemoryWatcher<uint>(new IntPtr(vars.MenuAddress + 0x4));
+		
+		// We have initialized, stop doing this every frame.
+		vars.Init = true;
+	}
+	
+	// Update the memory watchers
 	vars.Elapsed.Update(game);
+	vars.Level.Update(game);
+	vars.Menu.Update(game);
 }
+
+// Below is standard splitter code
 
 gameTime
 {
+	if(!vars.Init) return null;
 	return TimeSpan.FromSeconds(vars.Elapsed.Current);
 }
 
@@ -217,4 +259,30 @@ isLoading
 	return true;
 }
 
+start
+{
+	if(!vars.Init) return;
+	if(vars.Level.Current >= 1 && vars.Menu.Current != 0xFFFFFFFD /* true */) {
+		vars.MaxLevel = 1;
+		return true;
+	}
+}
+
+split
+{
+	if(!vars.Init) return;
+	if(vars.Level.Current > vars.MaxLevel) {
+		vars.MaxLevel = vars.Level.Current;
+		return true;
+	}
+}
+
+reset
+{
+	if(!vars.Init) return;
+	if(vars.Menu.Current == 0xFFFFFFFD /* true */) {
+		vars.MaxLevel = -1;
+		return true;
+	}
+}
 
